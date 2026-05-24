@@ -425,6 +425,85 @@ async def process_pdf(
     }
 
 
+
+@app.post("/process-pdf-partial")
+async def process_pdf_partial(
+    file: UploadFile = File(...),
+    document_id: str = Form(...),
+    filename: str = Form(...),
+    max_pages: int = Form(default=50),
+):
+    """
+    Procesa PDFs grandes en partes.
+    max_pages: cuántas páginas procesar en esta llamada.
+    Retorna chunks + indica si hay más páginas.
+    """
+    pdf_bytes = await file.read()
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_doc_pages = len(doc)
+        pages_to_process = min(max_pages, total_doc_pages)
+        
+        pages_data = []
+        for page_num in range(pages_to_process):
+            try:
+                page = doc[page_num]
+                page_data = extract_page_data(page, page_num + 1, doc)
+                pages_data.append(page_data)
+            except Exception:
+                # Si una página falla, continúa con la siguiente
+                continue
+        doc.close()
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Error procesando PDF: {str(e)}")
+
+    chunks = chunk_pages(pages_data, filename, document_id)
+
+    image_urls = {}
+    for page in pages_data:
+        for img_index, img in enumerate(page["images"]):
+            key = f"{page['page_number']}_{img_index}"
+            try:
+                public_url = await upload_image_to_supabase(
+                    img_b64=img["base64"],
+                    document_id=document_id,
+                    page_number=page["page_number"],
+                    img_index=img_index,
+                )
+                image_urls[key] = public_url
+            except Exception:
+                image_urls[key] = None
+
+    for chunk in chunks:
+        page_num = chunk["page_number"]
+        chunk_images = []
+        for img_index, img in enumerate(chunk.get("images", [])):
+            key = f"{page_num}_{img_index}"
+            url = image_urls.get(key)
+            if url:
+                chunk_images.append({"url": url, "page": page_num})
+        chunk["image_path"] = chunk_images[0]["url"] if chunk_images else None
+        chunk["image_description"] = None
+        chunk.pop("images", None)
+
+    total_images = sum(1 for c in chunks if c["image_path"])
+    has_more = pages_to_process < total_doc_pages
+
+    return {
+        "success": True,
+        "document_id": document_id,
+        "filename": filename,
+        "total_pages_in_doc": total_doc_pages,
+        "pages_processed": pages_to_process,
+        "has_more_pages": has_more,
+        "remaining_pages": total_doc_pages - pages_to_process,
+        "total_chunks": len(chunks),
+        "total_images_extracted": total_images,
+        "chunks": chunks,
+        "warning": f"PDF grande: se procesaron {pages_to_process} de {total_doc_pages} páginas." if has_more else None,
+    }
+
 @app.post("/match-chunks")
 async def match_chunks(body: dict):
     query_embedding = body.get("query_embedding")
@@ -451,3 +530,6 @@ async def match_chunks(body: dict):
         if resp.status_code != 200:
             raise HTTPException(status_code=500, detail=f"Error Supabase: {resp.text}")
         return resp.json()
+
+# El endpoint /process-pdf ya existe arriba.
+# Agrego endpoint de procesamiento parcial para PDFs grandes
