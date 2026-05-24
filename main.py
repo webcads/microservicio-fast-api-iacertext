@@ -1,25 +1,21 @@
 """
 IACertext - Microservicio FastAPI para procesamiento real de PDFs
-v4 - Extracción de tablas, OCR para PDFs escaneados, bounding boxes completos
+v5 - PyMuPDF (Fitz) + pdfplumber para tablas avanzadas
+     OCR con Tesseract, procesamiento parcial para PDFs grandes
 """
 
 import os
 import io
 import base64
 import fitz  # PyMuPDF
+import pdfplumber
 import httpx
 from PIL import Image as PILImage
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="IACertext PDF Processor", version="4.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="IACertext PDF Processor", version="5.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
@@ -50,58 +46,85 @@ def page_to_png_base64(page, zoom: float = 2.0) -> str | None:
         return None
 
 
-def extract_tables_from_page(page) -> list[dict]:
+def extract_tables_pdfplumber(pdf_bytes: bytes, page_number: int) -> list[dict]:
     """
-    Extrae tablas de una página PDF usando PyMuPDF.
-    Retorna lista de tablas con su contenido en Markdown y bounding box.
+    Usa pdfplumber para extraer tablas con alta precisión.
+    pdfplumber es mejor que PyMuPDF para tablas con bordes finos
+    y tablas sin bordes (detectadas por alineación de columnas).
     """
     tables = []
     try:
-        page_tables = page.find_tables()
-        for table_index, table in enumerate(page_tables):
-            try:
-                data = table.extract()
-                if not data or len(data) < 2:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            if page_number - 1 >= len(pdf.pages):
+                return tables
+            page = pdf.pages[page_number - 1]
+            
+            # Configuración mejorada para detectar más tipos de tablas
+            table_settings = {
+                "vertical_strategy": "lines_strict",
+                "horizontal_strategy": "lines_strict",
+                "snap_tolerance": 3,
+                "join_tolerance": 3,
+            }
+            
+            extracted_tables = page.extract_tables(table_settings)
+            
+            # Fallback: si no encuentra tablas con líneas, intenta por texto
+            if not extracted_tables:
+                table_settings2 = {
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                    "snap_tolerance": 5,
+                }
+                extracted_tables = page.extract_tables(table_settings2)
+
+            for t_idx, table_data in enumerate(extracted_tables):
+                if not table_data or len(table_data) < 2:
                     continue
 
-                # Convertir tabla a Markdown
-                headers = [str(cell or "").strip() for cell in data[0]]
-                rows = data[1:]
+                # Limpiar celdas None
+                clean_data = []
+                for row in table_data:
+                    clean_row = [str(cell or "").strip() for cell in row]
+                    if any(c for c in clean_row):
+                        clean_data.append(clean_row)
 
+                if len(clean_data) < 2:
+                    continue
+
+                headers = clean_data[0]
+                rows = clean_data[1:]
+
+                # Markdown
                 md_lines = ["| " + " | ".join(headers) + " |"]
                 md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
                 for row in rows:
-                    cells = [str(cell or "").strip() for cell in row]
-                    md_lines.append("| " + " | ".join(cells) + " |")
+                    # Asegurar misma cantidad de columnas
+                    while len(row) < len(headers):
+                        row.append("")
+                    md_lines.append("| " + " | ".join(row[:len(headers)]) + " |")
 
-                markdown_table = "\n".join(md_lines)
-
-                # También texto plano para embedding
-                plain_text = " | ".join(headers) + "\n"
+                plain = " | ".join(headers) + "\n"
                 for row in rows:
-                    plain_text += " | ".join([str(c or "").strip() for c in row]) + "\n"
+                    plain += " | ".join(row[:len(headers)]) + "\n"
 
                 tables.append({
-                    "index": table_index,
-                    "markdown": markdown_table,
-                    "plain_text": plain_text.strip(),
-                    "bbox": list(table.bbox),
+                    "index": t_idx,
+                    "markdown": "\n".join(md_lines),
+                    "plain_text": plain.strip(),
                     "rows": len(rows),
                     "cols": len(headers),
+                    "extractor": "pdfplumber",
                 })
-            except Exception:
-                continue
     except Exception:
         pass
     return tables
 
 
 def extract_text_with_ocr_fallback(page) -> tuple[str, bool]:
-    """Extrae texto vectorial, con fallback a OCR si es necesario."""
     text = page.get_text("text").strip()
     if len(text) >= MIN_TEXT_LENGTH:
         return text, False
-
     try:
         import pytesseract
         mat = fitz.Matrix(2.0, 2.0)
@@ -112,7 +135,6 @@ def extract_text_with_ocr_fallback(page) -> tuple[str, bool]:
             return ocr_text, True
     except Exception:
         pass
-
     return text, False
 
 
@@ -122,16 +144,13 @@ def bbox_distance(bbox1, bbox2) -> float:
     return abs(cy1 - cy2)
 
 
-def extract_page_data(page, page_num: int, doc) -> dict:
-    """Extrae todo el contenido de una página: texto, tablas, imágenes con bbox."""
-
-    # 1. Texto con OCR fallback
+def extract_page_data(page, page_num: int, doc, pdf_bytes: bytes) -> dict:
     page_text, used_ocr = extract_text_with_ocr_fallback(page)
 
-    # 2. Tablas estructuradas
-    tables = extract_tables_from_page(page)
+    # Tablas con pdfplumber (más preciso que PyMuPDF para tablas)
+    tables = extract_tables_pdfplumber(pdf_bytes, page_num)
 
-    # 3. Bloques de texto con bounding boxes
+    # Bloques de texto con bounding boxes (PyMuPDF)
     blocks = page.get_text("dict")["blocks"]
     text_blocks = []
     image_block_bboxes = []
@@ -144,14 +163,11 @@ def extract_page_data(page, page_num: int, doc) -> dict:
                 for span in line.get("spans", [])
             ).strip()
             if text:
-                text_blocks.append({
-                    "text": text,
-                    "bbox": list(block["bbox"]),
-                })
+                text_blocks.append({"text": text, "bbox": list(block["bbox"])})
         elif block["type"] == 1:
             image_block_bboxes.append(list(block["bbox"]))
 
-    # 4. Imágenes reales con bounding boxes
+    # Imágenes reales con PyMuPDF
     images_on_page = []
     image_list = page.get_images(full=True)
 
@@ -165,10 +181,9 @@ def extract_page_data(page, page_num: int, doc) -> dict:
             png_b64 = convert_to_png_base64(img_bytes_raw)
             if not png_b64:
                 continue
-
             img_bbox = image_block_bboxes[img_index] if img_index < len(image_block_bboxes) else [0, 0, page.rect.width, page.rect.height]
 
-            # Encontrar texto más cercano (mapeo texto↔imagen)
+            # Mapeo texto↔imagen por proximidad de bounding boxes
             nearest_text = None
             min_dist = float("inf")
             for tb in text_blocks:
@@ -183,28 +198,25 @@ def extract_page_data(page, page_num: int, doc) -> dict:
                 "base64": png_b64,
                 "bbox": img_bbox,
                 "nearest_text": nearest_text,
-                "proximity_distance": round(min_dist, 2),
+                "proximity_px": round(min_dist, 2),
             })
         except Exception:
             continue
 
-    # 5. Si la página no tiene texto ni imágenes, capturarla completa
+    # Captura de página completa si no hay texto ni imágenes
     if len(page_text) < MIN_TEXT_LENGTH and len(images_on_page) == 0:
         page_png = page_to_png_base64(page)
         if page_png:
             images_on_page.append({
-                "index": 0,
-                "ext": "png",
-                "base64": page_png,
+                "index": 0, "ext": "png", "base64": page_png,
                 "bbox": [0, 0, page.rect.width, page.rect.height],
-                "nearest_text": None,
-                "is_full_page": True,
+                "nearest_text": None, "is_full_page": True,
             })
 
-    # 6. Combinar texto con contenido de tablas
+    # Texto completo = texto vectorial + contenido de tablas
     full_text_parts = [page_text] if page_text else []
     for table in tables:
-        full_text_parts.append(f"\n[TABLA]\n{table['markdown']}\n")
+        full_text_parts.append(f"\n[TABLA - {table['rows']} filas x {table['cols']} columnas]\n{table['markdown']}\n")
 
     return {
         "page_number": page_num,
@@ -221,79 +233,63 @@ def extract_page_data(page, page_num: int, doc) -> dict:
     }
 
 
-def chunk_pages(pages_data: list, filename: str, document_id: str) -> list:
+def chunk_pages(pages_data: list, filename: str) -> list:
     chunks = []
     chunk_index = 0
 
     for page in pages_data:
-        text = page["text"].strip()
-
-        if not text:
-            text = f"Página {page['page_number']} — contenido visual sin texto extraible"
-
-        # Crear chunk especial para cada tabla de la página
+        # Chunk especial por tabla (pdfplumber)
         for table in page.get("tables", []):
             if table["plain_text"]:
                 chunks.append({
-                    "chunk_text": f"Tabla página {page['page_number']}:\n{table['plain_text']}",
+                    "chunk_text": f"Tabla (página {page['page_number']}):\n{table['plain_text']}",
                     "markdown_text": f"### Tabla (Página {page['page_number']})\n{table['markdown']}",
                     "page_number": page["page_number"],
                     "chunk_index": chunk_index,
                     "has_image": False,
                     "images": [],
-                    "bbox": table["bbox"],
                     "metadata": {
                         "source_doc": filename,
                         "chunk_index": chunk_index,
                         "type": "table",
+                        "extractor": "pdfplumber",
                         "rows": table["rows"],
                         "cols": table["cols"],
                     }
                 })
                 chunk_index += 1
 
-        # Chunks de texto normal
+        text = page["text"].strip() or f"Página {page['page_number']} — contenido visual"
+
         if len(text) > 1500:
             sentences = text.split(". ")
-            current_chunk = ""
-            sub_index = 0
+            current = ""
+            sub = 0
             for sentence in sentences:
-                if len(current_chunk) + len(sentence) > 1000 and current_chunk:
+                if len(current) + len(sentence) > 1000 and current:
                     chunks.append({
-                        "chunk_text": current_chunk.strip(),
-                        "markdown_text": current_chunk.strip(),
+                        "chunk_text": current.strip(),
+                        "markdown_text": current.strip(),
                         "page_number": page["page_number"],
                         "chunk_index": chunk_index,
-                        "has_image": sub_index == 0 and page["has_images"],
-                        "images": page["images"] if sub_index == 0 else [],
-                        "bbox": None,
-                        "metadata": {
-                            "source_doc": filename,
-                            "chunk_index": chunk_index,
-                            "used_ocr": page.get("used_ocr", False),
-                            "type": "text",
-                        }
+                        "has_image": sub == 0 and page["has_images"],
+                        "images": page["images"] if sub == 0 else [],
+                        "metadata": {"source_doc": filename, "chunk_index": chunk_index, "type": "text", "used_ocr": page.get("used_ocr", False)}
                     })
                     chunk_index += 1
-                    sub_index += 1
-                    current_chunk = sentence + ". "
+                    sub += 1
+                    current = sentence + ". "
                 else:
-                    current_chunk += sentence + ". "
-            if current_chunk.strip():
+                    current += sentence + ". "
+            if current.strip():
                 chunks.append({
-                    "chunk_text": current_chunk.strip(),
-                    "markdown_text": current_chunk.strip(),
+                    "chunk_text": current.strip(),
+                    "markdown_text": current.strip(),
                     "page_number": page["page_number"],
                     "chunk_index": chunk_index,
-                    "has_image": sub_index == 0 and page["has_images"],
-                    "images": page["images"] if sub_index == 0 else [],
-                    "bbox": None,
-                    "metadata": {
-                        "source_doc": filename,
-                        "chunk_index": chunk_index,
-                        "used_ocr": page.get("used_ocr", False),
-                        "type": "text",
-                    }
+                    "has_image": sub == 0 and page["has_images"],
+                    "images": page["images"] if sub == 0 else [],
+                    "metadata": {"source_doc": filename, "chunk_index": chunk_index, "type": "text", "used_ocr": page.get("used_ocr", False)}
                 })
                 chunk_index += 1
         else:
@@ -304,19 +300,12 @@ def chunk_pages(pages_data: list, filename: str, document_id: str) -> list:
                 "chunk_index": chunk_index,
                 "has_image": page["has_images"],
                 "images": page["images"],
-                "bbox": None,
-                "metadata": {
-                    "source_doc": filename,
-                    "chunk_index": chunk_index,
-                    "used_ocr": page.get("used_ocr", False),
-                    "type": "text",
-                }
+                "metadata": {"source_doc": filename, "chunk_index": chunk_index, "type": "text", "used_ocr": page.get("used_ocr", False)}
             })
             chunk_index += 1
 
     for chunk in chunks:
         chunk["metadata"]["total_chunks"] = len(chunks)
-
     return chunks
 
 
@@ -324,33 +313,53 @@ async def upload_image_to_supabase(img_b64: str, document_id: str, page_number: 
     img_bytes = base64.b64decode(img_b64)
     path = f"doc-{document_id}/p{page_number}_img{img_index}.png"
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
-    headers = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "image/png",
-        "x-upsert": "true",
-    }
+    headers = {"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "image/png", "x-upsert": "true"}
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, content=img_bytes, headers=headers)
         if resp.status_code not in (200, 201):
-            raise Exception(f"Error subiendo imagen: {resp.text}")
+            raise Exception(f"Error: {resp.text}")
     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
+
+
+async def process_pages(pages_data, document_id, filename):
+    chunks = chunk_pages(pages_data, filename)
+    image_urls = {}
+    for page in pages_data:
+        for img_index, img in enumerate(page["images"]):
+            key = f"{page['page_number']}_{img_index}"
+            try:
+                image_urls[key] = await upload_image_to_supabase(img["base64"], document_id, page["page_number"], img_index)
+            except Exception:
+                image_urls[key] = None
+
+    for chunk in chunks:
+        page_num = chunk["page_number"]
+        chunk_images = []
+        for img_index, img in enumerate(chunk.get("images", [])):
+            url = image_urls.get(f"{page_num}_{img_index}")
+            if url:
+                chunk_images.append({"url": url, "page": page_num, "bbox": img.get("bbox"), "nearest_text": img.get("nearest_text")})
+        chunk["image_path"] = chunk_images[0]["url"] if chunk_images else None
+        chunk["image_description"] = None
+        chunk.pop("images", None)
+
+    return chunks
 
 
 @app.get("/health")
 async def health():
-    ocr_available = False
+    ocr_ok = False
     try:
         import pytesseract
         pytesseract.get_tesseract_version()
-        ocr_available = True
+        ocr_ok = True
     except Exception:
         pass
     return {
-        "status": "ok",
-        "service": "IACertext PDF Processor",
-        "version": "4.0.0",
-        "features": ["text", "tables", "images", "bounding_boxes", "text_image_mapping"],
-        "ocr_available": ocr_available,
+        "status": "ok", "version": "5.0.0",
+        "extractors": ["PyMuPDF (fitz)", "pdfplumber"],
+        "features": ["text", "tables", "images", "bounding_boxes", "text_image_mapping", "ocr_fallback"],
+        "ocr_available": ocr_ok,
     }
 
 
@@ -359,68 +368,46 @@ async def process_pdf(
     file: UploadFile = File(...),
     document_id: str = Form(...),
     filename: str = Form(...),
+    max_pages: int = Form(default=0),  # 0 = todas las páginas
 ):
     pdf_bytes = await file.read()
-
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_doc_pages = len(doc)
+        pages_to_process = min(max_pages, total_doc_pages) if max_pages > 0 else total_doc_pages
+        
         pages_data = []
-        for page_num, page in enumerate(doc, start=1):
-            page_data = extract_page_data(page, page_num, doc)
-            pages_data.append(page_data)
+        for page_num in range(pages_to_process):
+            try:
+                page = doc[page_num]
+                page_data = extract_page_data(page, page_num + 1, doc, pdf_bytes)
+                pages_data.append(page_data)
+            except Exception:
+                continue  # Si una página falla, continúa con la siguiente
         doc.close()
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"Error procesando PDF: {str(e)}")
 
-    chunks = chunk_pages(pages_data, filename, document_id)
-
-    # Subir imágenes a Supabase Storage
-    image_urls = {}
-    for page in pages_data:
-        for img_index, img in enumerate(page["images"]):
-            key = f"{page['page_number']}_{img_index}"
-            try:
-                public_url = await upload_image_to_supabase(
-                    img_b64=img["base64"],
-                    document_id=document_id,
-                    page_number=page["page_number"],
-                    img_index=img_index,
-                )
-                image_urls[key] = public_url
-            except Exception:
-                image_urls[key] = None
-
-    # Enriquecer chunks con URLs de imágenes
-    for chunk in chunks:
-        page_num = chunk["page_number"]
-        chunk_images = []
-        for img_index, img in enumerate(chunk.get("images", [])):
-            key = f"{page_num}_{img_index}"
-            url = image_urls.get(key)
-            if url:
-                chunk_images.append({
-                    "url": url,
-                    "page": page_num,
-                    "bbox": img.get("bbox"),
-                    "nearest_text": img.get("nearest_text"),
-                })
-        chunk["image_path"] = chunk_images[0]["url"] if chunk_images else None
-        chunk["image_description"] = None
-        chunk.pop("images", None)
+    chunks = await process_pages(pages_data, document_id, filename)
 
     total_images = sum(1 for c in chunks if c["image_path"])
     total_tables = sum(1 for p in pages_data if p["has_tables"])
     used_ocr = any(p.get("used_ocr") for p in pages_data)
+    has_more = pages_to_process < total_doc_pages if max_pages > 0 else False
 
     return {
         "success": True,
         "document_id": document_id,
         "filename": filename,
-        "total_pages": len(pages_data),
+        "total_pages_in_doc": total_doc_pages,
+        "total_pages": pages_to_process,
         "total_chunks": len(chunks),
         "total_images_extracted": total_images,
         "total_tables_extracted": total_tables,
         "used_ocr": used_ocr,
+        "has_more_pages": has_more,
+        "remaining_pages": total_doc_pages - pages_to_process if has_more else 0,
+        "warning": f"Se procesaron {pages_to_process} de {total_doc_pages} páginas." if has_more else None,
         "chunks": chunks,
     }
 
@@ -430,14 +417,11 @@ async def match_chunks(body: dict):
     query_embedding = body.get("query_embedding")
     match_count = body.get("match_count", 5)
     doc_ids = body.get("doc_ids")
-
     if not query_embedding:
         raise HTTPException(status_code=400, detail="query_embedding requerido")
-
     payload = {"query_embedding": query_embedding, "match_count": match_count}
     if doc_ids:
         payload["doc_ids"] = doc_ids
-
     url = f"{SUPABASE_URL}/rest/v1/rpc/match_chunks"
     headers = {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -445,7 +429,6 @@ async def match_chunks(body: dict):
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
-
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code != 200:
