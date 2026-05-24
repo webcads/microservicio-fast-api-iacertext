@@ -2,9 +2,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Dependencias del sistema para PyMuPDF
+# Tesseract OCR para PDFs escaneados + idiomas español e inglés
 RUN apt-get update && apt-get install -y \
-    libmupdf-dev \
+    tesseract-ocr \
+    tesseract-ocr-spa \
+    tesseract-ocr-eng \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
