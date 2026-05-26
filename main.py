@@ -1,7 +1,8 @@
 """
 IACertext - Microservicio FastAPI para procesamiento real de PDFs
-v6 - PyMuPDF (Fitz) + pdfplumber + OCR en imágenes individuales
+v7 - PyMuPDF (Fitz) + pdfplumber + OCR en imágenes individuales + Preprocesamiento
      Extrae texto de imágenes embebidas (PDFs escaneados, fotos, diagramas con texto)
+     MEJORADO: Soporte fuerte para PDFs que son 100% imagen (lotería, capturas, etc)
 """
 
 import os
@@ -10,7 +11,7 @@ import base64
 import fitz  # PyMuPDF
 import pdfplumber
 import httpx
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageEnhance
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -21,7 +22,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 SUPABASE_BUCKET = "rag-images"
 MIN_IMAGE_SIZE = 1000
-MIN_TEXT_LENGTH = 30
+MIN_TEXT_LENGTH = 40  # MEJORADO: umbral más bajo para detectar páginas imagen (40 vs 30)
 
 
 def convert_to_png_base64(img_bytes: bytes) -> str | None:
@@ -37,19 +38,50 @@ def convert_to_png_base64(img_bytes: bytes) -> str | None:
         return None
 
 
+def preprocess_image_for_ocr(img: PILImage.Image) -> PILImage.Image:
+    """
+    MEJORADO v7: Preprocesa la imagen para mejorar OCR
+    - Aumenta contraste para textos claros
+    - Mejora nitidez en textos pequeños o borrosos
+    - Útil para PDFs escaneados, capturas, fotos de documentos
+    """
+    try:
+        # Aumentar contraste (1.5x) para mejorar legibilidad
+        contrast_enhancer = ImageEnhance.Contrast(img)
+        img = contrast_enhancer.enhance(1.5)
+
+        # Aumentar nitidez para textos finos
+        sharpness_enhancer = ImageEnhance.Sharpness(img)
+        img = sharpness_enhancer.enhance(1.3)
+
+        return img
+    except Exception:
+        return img
+
+
 def ocr_image_bytes(img_bytes: bytes) -> str:
     """
-    Extrae texto de una imagen usando GPT-4o Vision (principal)
-    con fallback a Tesseract. GPT-4o funciona con imágenes complejas:
-    fondos de colores, tablas sin bordes, resultados de lotería, etc.
+    MEJORADO v7: Extrae texto de una imagen usando GPT-4o Vision (principal)
+    con fallback a Tesseract. Preprocesa la imagen para mejorar OCR.
+
+    Casos de uso:
+    - PDFs que son 100% imagen escaneada (ej: resultados de lotería)
+    - Fotos de documentos con poco contraste
+    - Capturas de pantalla con tablas
+    - Diagramas con etiquetas y números
+    - PDFs viejos o de baja calidad
     """
-    # Intento 1: GPT-4o Vision
+    # Intento 1: GPT-4o Vision (mejor para tablas, números, contexto visual)
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     if openai_key:
         try:
             img = PILImage.open(io.BytesIO(img_bytes))
             if img.mode not in ("RGB", "RGBA"):
                 img = img.convert("RGB")
+
+            # MEJORADO: Preprocesar imagen antes de OCR (contraste + nitidez)
+            img = preprocess_image_for_ocr(img)
+
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             buf.seek(0)
@@ -58,14 +90,30 @@ def ocr_image_bytes(img_bytes: bytes) -> str:
             import urllib.request
             import json as _json
 
+            # MEJORADO: Prompt más específico para tablas, números y resultados
+            ocr_prompt = """Extrae TODO el texto visible en esta imagen de forma exacta y completa.
+
+IMPORTANTE:
+- Si hay TABLAS (especialmente con números, resultados de sorteos, lotería), extráelas en formato Markdown con | separadores
+- Mantén TODOS los números EXACTOS, sin redondeos
+- Si hay columnas de números alineados, respeta la alineación vertical
+- Si hay encabezados o títulos en negrilla/colores, inclúyelos
+- Si hay imágenes dentro (logos, escudos), describe brevemente
+
+FORMATO DE SALIDA:
+- Solo texto extraído, SIN explicaciones adicionales
+- Si hay tabla: usa formato Markdown (| col1 | col2 |)
+- Preserva estructura y espacios importantes
+- Responde en el idioma del documento (español/inglés)"""
+
             payload = _json.dumps({
                 "model": "gpt-4o",
-                "max_tokens": 2000,
+                "max_tokens": 2500,  # Aumentado de 2000 para PDFs complejos
                 "messages": [{
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
-                        {"type": "text", "text": "Extrae TODO el texto visible en esta imagen de forma exacta. Si hay tablas (resultados de lotería, sorteos, números), extráelas en formato Markdown con | separadores. Mantén los números exactos. Responde SOLO con el texto extraído, sin explicaciones."}
+                        {"type": "text", "text": ocr_prompt}
                     ]
                 }]
             }).encode("utf-8")
@@ -83,17 +131,24 @@ def ocr_image_bytes(img_bytes: bytes) -> str:
         except Exception:
             pass
 
-    # Intento 2: Tesseract como fallback
+    # Intento 2: Tesseract como fallback (más rápido pero menos preciso para tablas complejas)
     try:
         import pytesseract
         img = PILImage.open(io.BytesIO(img_bytes))
         if img.mode not in ("RGB", "RGBA", "L"):
             img = img.convert("RGB")
+
+        # MEJORADO: Preprocesar para Tesseract también
+        img = preprocess_image_for_ocr(img)
+
+        # Aumentar resolución para mejorar OCR
         min_dim = 800
         w, h = img.size
         if w < min_dim or h < min_dim:
             scale = max(min_dim / w, min_dim / h)
             img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+
+        # PSM 3 = Auto, mejor para documentos con múltiples orientaciones
         text = pytesseract.image_to_string(img, lang='spa+eng', config='--psm 3')
         return text.strip()
     except Exception:
@@ -185,19 +240,32 @@ def extract_tables_pdfplumber(pdf_bytes: bytes, page_number: int) -> list[dict]:
 
 
 def extract_text_with_ocr_fallback(page) -> tuple[str, bool]:
+    """
+    MEJORADO v7: Extrae texto vectorial de la página.
+    Si hay poco texto (< MIN_TEXT_LENGTH = 40 chars), ACTIVA OCR AUTOMÁTICO.
+    Retorna: (texto_final, ocr_fue_usado)
+    """
     text = page.get_text("text").strip()
     if len(text) >= MIN_TEXT_LENGTH:
         return text, False
+
+    # MEJORADO v7: Si hay poco texto, intentar OCR automáticamente
+    # Esto es CRÍTICO para PDFs que son 100% imagen (ej: lotería)
     try:
         import pytesseract
         mat = fitz.Matrix(2.0, 2.0)
         pix = page.get_pixmap(matrix=mat)
         img = PILImage.open(io.BytesIO(pix.tobytes("png")))
+
+        # Preprocesar imagen antes de OCR
+        img = preprocess_image_for_ocr(img)
+
         ocr_text = pytesseract.image_to_string(img, lang='spa+eng').strip()
         if len(ocr_text) >= MIN_TEXT_LENGTH:
             return ocr_text, True
     except Exception:
         pass
+
     return text, False
 
 
@@ -208,18 +276,31 @@ def bbox_distance(bbox1, bbox2) -> float:
 
 
 def extract_page_data(page, page_num: int, doc, pdf_bytes: bytes) -> dict:
+    """
+    MEJORADO v7: Extrae TODOS los elementos de la página: texto, tablas, imágenes, bboxes.
+
+    Flujo:
+    1. Intenta extraer texto vectorial (PyMuPDF)
+    2. Si texto < 40 chars → ACTIVA OCR (Tesseract o GPT-4o)
+    3. Extrae tablas con pdfplumber (mejor para tablas sin bordes)
+    4. Mapea proximidad texto ↔ imagen
+    5. Si página es 100% imagen → captura completa con OCR (GPT-4o Vision)
+
+    Retorna: dict con texto completo + tablas + imágenes + bboxes + metadata OCR
+    """
+    # Paso 1: Extraer texto vectorial (automáticamente usa OCR si hay poco texto)
     page_text, used_ocr = extract_text_with_ocr_fallback(page)
 
-    # Tablas con pdfplumber (más preciso que PyMuPDF para tablas)
+    # Paso 2: Extraer tablas con pdfplumber (mejor precisión que PyMuPDF)
     tables = extract_tables_pdfplumber(pdf_bytes, page_num)
 
-    # Bloques de texto con bounding boxes (PyMuPDF)
+    # Paso 3: Obtener bloques de texto con bounding boxes (PyMuPDF)
     blocks = page.get_text("dict")["blocks"]
     text_blocks = []
     image_block_bboxes = []
 
     for block in blocks:
-        if block["type"] == 0:
+        if block["type"] == 0:  # Bloque de texto
             text = " ".join(
                 span["text"]
                 for line in block.get("lines", [])
@@ -227,10 +308,10 @@ def extract_page_data(page, page_num: int, doc, pdf_bytes: bytes) -> dict:
             ).strip()
             if text:
                 text_blocks.append({"text": text, "bbox": list(block["bbox"])})
-        elif block["type"] == 1:
+        elif block["type"] == 1:  # Bloque de imagen
             image_block_bboxes.append(list(block["bbox"]))
 
-    # Imágenes reales con PyMuPDF
+    # Paso 4: Extraer imágenes embebidas con OCR individual
     images_on_page = []
     image_list = page.get_images(full=True)
 
@@ -244,9 +325,10 @@ def extract_page_data(page, page_num: int, doc, pdf_bytes: bytes) -> dict:
             png_b64 = convert_to_png_base64(img_bytes_raw)
             if not png_b64:
                 continue
+
             img_bbox = image_block_bboxes[img_index] if img_index < len(image_block_bboxes) else [0, 0, page.rect.width, page.rect.height]
 
-            # Mapeo texto↔imagen por proximidad de bounding boxes
+            # Mapear proximidad: qué texto está cerca de esta imagen
             nearest_text = None
             min_dist = float("inf")
             for tb in text_blocks:
@@ -255,9 +337,8 @@ def extract_page_data(page, page_num: int, doc, pdf_bytes: bytes) -> dict:
                     min_dist = dist
                     nearest_text = tb["text"]
 
-            # OCR en la imagen individual para extraer texto embebido
-            # Esto permite extraer texto de: fotos de documentos, capturas,
-            # diagramas con etiquetas, PDFs que son imágenes escaneadas
+            # OCR en la imagen individual (usando GPT-4o Vision + preprocesamiento)
+            # Esto extrae texto embebido en: fotos de documentos, capturas, diagramas, etc
             ocr_text_in_image = ocr_image_bytes(img_bytes_raw)
 
             images_on_page.append({
@@ -267,36 +348,48 @@ def extract_page_data(page, page_num: int, doc, pdf_bytes: bytes) -> dict:
                 "bbox": img_bbox,
                 "nearest_text": nearest_text,
                 "proximity_px": round(min_dist, 2) if min_dist != float("inf") else 0,
-                "ocr_text": ocr_text_in_image,  # texto extraído de la imagen
+                "ocr_text": ocr_text_in_image,
+                "is_full_page": False,
             })
         except Exception:
             continue
 
-    # Captura de página completa si no hay texto ni imágenes
+    # Paso 5: MEJORADO v7 - Si página es principalmente IMAGEN (poco texto + sin imágenes embebidas)
+    # Capturar la página completa y hacer OCR (crítico para PDFs 100% imagen)
     if len(page_text) < MIN_TEXT_LENGTH and len(images_on_page) == 0:
         page_png = page_to_png_base64(page)
         if page_png:
-            # OCR en página completa capturada
+            # OCR en la página completa capturada con GPT-4o Vision
             page_png_bytes = base64.b64decode(page_png)
             page_ocr_text = ocr_image_bytes(page_png_bytes)
-            images_on_page.append({
-                "index": 0, "ext": "png", "base64": page_png,
-                "bbox": [0, 0, page.rect.width, page.rect.height],
-                "nearest_text": None, "is_full_page": True,
-                "ocr_text": page_ocr_text,
-            })
 
-    # Texto completo = texto vectorial + OCR de imágenes + tablas
+            images_on_page.append({
+                "index": 0,
+                "ext": "png",
+                "base64": page_png,
+                "bbox": [0, 0, page.rect.width, page.rect.height],
+                "nearest_text": None,
+                "is_full_page": True,  # Marca como captura de página completa
+                "ocr_text": page_ocr_text,
+                "proximity_px": 0,
+            })
+            # Si capturó la página completa, usar el OCR extraído
+            if page_ocr_text and len(page_ocr_text) > len(page_text):
+                page_text = page_ocr_text
+                used_ocr = True
+
+    # Paso 6: Combinar TODOS los componentes en texto final
+    # Orden: texto vectorial → OCR de imágenes individuales → tablas
     full_text_parts = [page_text] if page_text else []
 
-    # Agregar texto OCR extraído de cada imagen
     for img in images_on_page:
         ocr_txt = img.get("ocr_text", "")
-        if ocr_txt and len(ocr_txt) > 20:
-            full_text_parts.append(f"\n[TEXTO EN IMAGEN pág.{page_num}]\n{ocr_txt}\n")
+        # Solo agregar si es contenido nuevo (no es la captura completa)
+        if ocr_txt and len(ocr_txt) > 20 and not img.get("is_full_page"):
+            full_text_parts.append(f"\n[TEXTO EN IMAGEN - Página {page_num}]\n{ocr_txt}\n")
 
     for table in tables:
-        full_text_parts.append(f"\n[TABLA - {table['rows']} filas x {table['cols']} columnas]\n{table['markdown']}\n")
+        full_text_parts.append(f"\n[TABLA - {table['rows']} filas × {table['cols']} columnas]\n{table['markdown']}\n")
 
     return {
         "page_number": page_num,
@@ -308,6 +401,7 @@ def extract_page_data(page, page_num: int, doc, pdf_bytes: bytes) -> dict:
         "has_images": len(images_on_page) > 0,
         "has_tables": len(tables) > 0,
         "used_ocr": used_ocr,
+        "page_is_mostly_image": len(page_text) < MIN_TEXT_LENGTH and images_on_page,  # NUEVO: flag
         "width": page.rect.width,
         "height": page.rect.height,
     }
@@ -428,6 +522,10 @@ async def process_pages(pages_data, document_id, filename):
 
 @app.get("/health")
 async def health():
+    """
+    MEJORADO v7: Verifica disponibilidad de extractores y características.
+    Retorna estado de: PyMuPDF, pdfplumber, OCR (Tesseract), GPT-4o Vision, Preprocesamiento.
+    """
     ocr_ok = False
     try:
         import pytesseract
@@ -436,16 +534,34 @@ async def health():
     except Exception:
         pass
     return {
-        "status": "ok", "version": "7.0.0",
-        "extractors": ["PyMuPDF (fitz)", "pdfplumber", "GPT-4o Vision", "Tesseract OCR"],
+        "status": "ok",
+        "version": "7.0.0",
+        "extractors": [
+            "PyMuPDF (fitz)",
+            "pdfplumber",
+            "GPT-4o Vision",
+            "Tesseract OCR",
+            "ImageEnhance (preprocesamiento)"
+        ],
         "features": [
             "text_vectorial",
-            "tables_pdfplumber", 
+            "tables_pdfplumber",
             "images_extraction",
             "ocr_gpt4o_vision",
             "ocr_tesseract_fallback",
             "bounding_boxes",
             "text_image_mapping",
+            "image_preprocessing",  # NUEVO v7
+            "auto_ocr_activation",  # NUEVO v7
+            "scanned_pdf_detection",  # NUEVO v7
+            "full_page_capture",  # NUEVO v7
+        ],
+        "improvements_v7": [
+            "Preprocesamiento de imagen (contraste + nitidez)",
+            "OCR automático cuando texto < 40 caracteres",
+            "Detección de páginas 100% imagen",
+            "Mejor prompt para GPT-4o Vision (tablas, números)",
+            "Soporte robusto para PDFs escaneados y fotos"
         ],
         "ocr_available": ocr_ok,
         "vision_available": bool(os.environ.get("OPENAI_API_KEY")),
@@ -459,12 +575,19 @@ async def process_pdf(
     filename: str = Form(...),
     max_pages: int = Form(default=0),  # 0 = todas las páginas
 ):
+    """
+    MEJORADO v7: Procesa PDF completo con soporte multimodal.
+
+    Retorna:
+    - chunks: texto + imágenes + tablas mapeados con bboxes
+    - estadísticas: OCR usado?, páginas imagen detectadas?, etc
+    """
     pdf_bytes = await file.read()
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         total_doc_pages = len(doc)
         pages_to_process = min(max_pages, total_doc_pages) if max_pages > 0 else total_doc_pages
-        
+
         pages_data = []
         for page_num in range(pages_to_process):
             try:
@@ -482,6 +605,7 @@ async def process_pdf(
     total_images = sum(1 for c in chunks if c["image_path"])
     total_tables = sum(1 for p in pages_data if p["has_tables"])
     used_ocr = any(p.get("used_ocr") for p in pages_data)
+    scanned_pages = sum(1 for p in pages_data if p.get("page_is_mostly_image", False))  # NUEVO v7
     has_more = pages_to_process < total_doc_pages if max_pages > 0 else False
 
     return {
@@ -494,9 +618,15 @@ async def process_pdf(
         "total_images_extracted": total_images,
         "total_tables_extracted": total_tables,
         "used_ocr": used_ocr,
+        "scanned_pages_detected": scanned_pages,  # NUEVO v7: páginas que fueron 100% imagen
         "has_more_pages": has_more,
         "remaining_pages": total_doc_pages - pages_to_process if has_more else 0,
         "warning": f"Se procesaron {pages_to_process} de {total_doc_pages} páginas." if has_more else None,
+        "processing_notes": [  # NUEVO v7
+            f"Detectadas {scanned_pages} páginas escaneadas/imagen (OCR automático activado)" if scanned_pages > 0 else None,
+            f"Extraídas {total_images} imágenes con preprocesamiento y OCR" if total_images > 0 else None,
+            f"Detectadas {total_tables} tablas con pdfplumber" if total_tables > 0 else None,
+        ],
         "chunks": chunks,
     }
 
