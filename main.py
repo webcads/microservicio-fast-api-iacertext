@@ -39,32 +39,63 @@ def convert_to_png_base64(img_bytes: bytes) -> str | None:
 
 def ocr_image_bytes(img_bytes: bytes) -> str:
     """
-    Aplica OCR (Tesseract) a una imagen individual para extraer texto.
-    Funciona con imágenes embebidas en PDFs: fotos, capturas, diagramas con texto.
-    Retorna el texto extraído o string vacío si no hay texto legible.
+    Extrae texto de una imagen usando GPT-4o Vision (principal)
+    con fallback a Tesseract. GPT-4o funciona con imágenes complejas:
+    fondos de colores, tablas sin bordes, resultados de lotería, etc.
     """
+    # Intento 1: GPT-4o Vision
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if openai_key:
+        try:
+            img = PILImage.open(io.BytesIO(img_bytes))
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            img_b64 = base64.b64encode(buf.read()).decode("utf-8")
+
+            import urllib.request
+            import json as _json
+
+            payload = _json.dumps({
+                "model": "gpt-4o",
+                "max_tokens": 2000,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
+                        {"type": "text", "text": "Extrae TODO el texto visible en esta imagen de forma exacta. Si hay tablas (resultados de lotería, sorteos, números), extráelas en formato Markdown con | separadores. Mantén los números exactos. Responde SOLO con el texto extraído, sin explicaciones."}
+                    ]
+                }]
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=payload,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {openai_key}"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = _json.loads(resp.read().decode("utf-8"))
+                text = result["choices"][0]["message"]["content"]
+                if text and len(text.strip()) > 10:
+                    return text.strip()
+        except Exception:
+            pass
+
+    # Intento 2: Tesseract como fallback
     try:
         import pytesseract
         img = PILImage.open(io.BytesIO(img_bytes))
-
-        # Convertir a RGB para Tesseract
         if img.mode not in ("RGB", "RGBA", "L"):
             img = img.convert("RGB")
-
-        # Mejorar imagen para OCR: aumentar resolución si es pequeña
         min_dim = 800
         w, h = img.size
         if w < min_dim or h < min_dim:
             scale = max(min_dim / w, min_dim / h)
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            img = img.resize((new_w, new_h), PILImage.LANCZOS)
-
-        # OCR con español e inglés
+            img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
         text = pytesseract.image_to_string(img, lang='spa+eng', config='--psm 3')
         return text.strip()
-    except ImportError:
-        return ""
     except Exception:
         return ""
 
@@ -405,18 +436,19 @@ async def health():
     except Exception:
         pass
     return {
-        "status": "ok", "version": "6.0.0",
-        "extractors": ["PyMuPDF (fitz)", "pdfplumber", "Tesseract OCR"],
+        "status": "ok", "version": "7.0.0",
+        "extractors": ["PyMuPDF (fitz)", "pdfplumber", "GPT-4o Vision", "Tesseract OCR"],
         "features": [
             "text_vectorial",
-            "tables_pdfplumber",
+            "tables_pdfplumber", 
             "images_extraction",
-            "ocr_full_page",
-            "ocr_per_image",       # NUEVO: OCR en cada imagen individual
+            "ocr_gpt4o_vision",
+            "ocr_tesseract_fallback",
             "bounding_boxes",
             "text_image_mapping",
         ],
         "ocr_available": ocr_ok,
+        "vision_available": bool(os.environ.get("OPENAI_API_KEY")),
     }
 
 
