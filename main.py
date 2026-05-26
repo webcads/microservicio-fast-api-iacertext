@@ -1,7 +1,7 @@
 """
 IACertext - Microservicio FastAPI para procesamiento real de PDFs
-v5 - PyMuPDF (Fitz) + pdfplumber para tablas avanzadas
-     OCR con Tesseract, procesamiento parcial para PDFs grandes
+v6 - PyMuPDF (Fitz) + pdfplumber + OCR en imágenes individuales
+     Extrae texto de imágenes embebidas (PDFs escaneados, fotos, diagramas con texto)
 """
 
 import os
@@ -35,6 +35,38 @@ def convert_to_png_base64(img_bytes: bytes) -> str | None:
         return base64.b64encode(buf.read()).decode("utf-8")
     except Exception:
         return None
+
+
+def ocr_image_bytes(img_bytes: bytes) -> str:
+    """
+    Aplica OCR (Tesseract) a una imagen individual para extraer texto.
+    Funciona con imágenes embebidas en PDFs: fotos, capturas, diagramas con texto.
+    Retorna el texto extraído o string vacío si no hay texto legible.
+    """
+    try:
+        import pytesseract
+        img = PILImage.open(io.BytesIO(img_bytes))
+
+        # Convertir a RGB para Tesseract
+        if img.mode not in ("RGB", "RGBA", "L"):
+            img = img.convert("RGB")
+
+        # Mejorar imagen para OCR: aumentar resolución si es pequeña
+        min_dim = 800
+        w, h = img.size
+        if w < min_dim or h < min_dim:
+            scale = max(min_dim / w, min_dim / h)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img = img.resize((new_w, new_h), PILImage.LANCZOS)
+
+        # OCR con español e inglés
+        text = pytesseract.image_to_string(img, lang='spa+eng', config='--psm 3')
+        return text.strip()
+    except ImportError:
+        return ""
+    except Exception:
+        return ""
 
 
 def page_to_png_base64(page, zoom: float = 2.0) -> str | None:
@@ -192,13 +224,19 @@ def extract_page_data(page, page_num: int, doc, pdf_bytes: bytes) -> dict:
                     min_dist = dist
                     nearest_text = tb["text"]
 
+            # OCR en la imagen individual para extraer texto embebido
+            # Esto permite extraer texto de: fotos de documentos, capturas,
+            # diagramas con etiquetas, PDFs que son imágenes escaneadas
+            ocr_text_in_image = ocr_image_bytes(img_bytes_raw)
+
             images_on_page.append({
                 "index": img_index,
                 "ext": "png",
                 "base64": png_b64,
                 "bbox": img_bbox,
                 "nearest_text": nearest_text,
-                "proximity_px": round(min_dist, 2),
+                "proximity_px": round(min_dist, 2) if min_dist != float("inf") else 0,
+                "ocr_text": ocr_text_in_image,  # texto extraído de la imagen
             })
         except Exception:
             continue
@@ -207,14 +245,25 @@ def extract_page_data(page, page_num: int, doc, pdf_bytes: bytes) -> dict:
     if len(page_text) < MIN_TEXT_LENGTH and len(images_on_page) == 0:
         page_png = page_to_png_base64(page)
         if page_png:
+            # OCR en página completa capturada
+            page_png_bytes = base64.b64decode(page_png)
+            page_ocr_text = ocr_image_bytes(page_png_bytes)
             images_on_page.append({
                 "index": 0, "ext": "png", "base64": page_png,
                 "bbox": [0, 0, page.rect.width, page.rect.height],
                 "nearest_text": None, "is_full_page": True,
+                "ocr_text": page_ocr_text,
             })
 
-    # Texto completo = texto vectorial + contenido de tablas
+    # Texto completo = texto vectorial + OCR de imágenes + tablas
     full_text_parts = [page_text] if page_text else []
+
+    # Agregar texto OCR extraído de cada imagen
+    for img in images_on_page:
+        ocr_txt = img.get("ocr_text", "")
+        if ocr_txt and len(ocr_txt) > 20:
+            full_text_parts.append(f"\n[TEXTO EN IMAGEN pág.{page_num}]\n{ocr_txt}\n")
+
     for table in tables:
         full_text_parts.append(f"\n[TABLA - {table['rows']} filas x {table['cols']} columnas]\n{table['markdown']}\n")
 
@@ -356,9 +405,17 @@ async def health():
     except Exception:
         pass
     return {
-        "status": "ok", "version": "5.0.0",
-        "extractors": ["PyMuPDF (fitz)", "pdfplumber"],
-        "features": ["text", "tables", "images", "bounding_boxes", "text_image_mapping", "ocr_fallback"],
+        "status": "ok", "version": "6.0.0",
+        "extractors": ["PyMuPDF (fitz)", "pdfplumber", "Tesseract OCR"],
+        "features": [
+            "text_vectorial",
+            "tables_pdfplumber",
+            "images_extraction",
+            "ocr_full_page",
+            "ocr_per_image",       # NUEVO: OCR en cada imagen individual
+            "bounding_boxes",
+            "text_image_mapping",
+        ],
         "ocr_available": ocr_ok,
     }
 
